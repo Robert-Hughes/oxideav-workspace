@@ -98,9 +98,15 @@ pub struct PlayerEngine {
     clock_origin: Duration,
     /// Driver master-clock samples at the moment of the last seek.
     clock_baseline_samples: u64,
-    /// Cumulative wall-clock duration of audio queued to the
-    /// driver. Adds up samples_played / sample_rate.
+    /// Cumulative media-timeline duration of audio queued to the
+    /// driver. Adds up samples_played / sample_rate from the initial
+    /// media timestamp anchor.
     last_audio_end: Duration,
+    /// False until initial playback has been anchored to the first
+    /// timestamped decoded frame (or a trustworthy non-zero declared
+    /// stream start time). Some demuxers, notably MPEG-TS, only learn
+    /// their first PTS after `start()` has already been sent to the sink.
+    initial_clock_anchored: bool,
     /// pts of the most recent video frame pushed into `video_queue`.
     last_video_pts: Option<i64>,
     /// pts of the most recent video frame actually presented.
@@ -203,6 +209,15 @@ impl PlayerEngine {
             driver.set_source_video_params(&s.params);
         }
 
+        let declared_origin = initial_declared_start(audio_stream.as_ref(), video_stream.as_ref());
+        let initial_clock_anchored = declared_origin.is_some();
+        let clock_origin = declared_origin.unwrap_or(Duration::ZERO);
+        let last_audio_end = if audio_stream.is_some() {
+            clock_origin
+        } else {
+            Duration::ZERO
+        };
+
         Self {
             driver,
             exec_handle,
@@ -211,9 +226,10 @@ impl PlayerEngine {
             video_stream,
             audio_rate,
             video_queue: VecDeque::new(),
-            clock_origin: Duration::ZERO,
+            clock_origin,
             clock_baseline_samples: 0,
-            last_audio_end: Duration::ZERO,
+            last_audio_end,
+            initial_clock_anchored,
             last_video_pts: None,
             last_video_presented_pts: None,
             paused: false,
@@ -385,7 +401,11 @@ impl PlayerEngine {
             prof.record(ProfSection::Status, t0.elapsed());
 
             // 5. Exit conditions: executor done + audio drained.
-            if self.executor_done && self.audio_drained() && !self.paused {
+            if self.executor_done
+                && self.audio_drained()
+                && self.video_queue.is_empty()
+                && !self.paused
+            {
                 break;
             }
 
@@ -513,6 +533,11 @@ impl PlayerEngine {
                     // audio / video frames.
                     match frame {
                         Frame::Audio(af) => {
+                            if !self.initial_clock_anchored {
+                                if let Some(tb) = self.audio_stream.as_ref().map(|s| s.time_base) {
+                                    self.anchor_initial_clock_from_pts(af.pts, tb);
+                                }
+                            }
                             if self.audio_rate > 0 {
                                 self.last_audio_end += Duration::from_secs_f64(
                                     af.samples as f64 / self.audio_rate as f64,
@@ -521,6 +546,11 @@ impl PlayerEngine {
                             self.driver.queue_audio(&af)?;
                         }
                         Frame::Video(vf) => {
+                            if !self.initial_clock_anchored {
+                                if let Some(tb) = self.video_stream.as_ref().map(|s| s.time_base) {
+                                    self.anchor_initial_clock_from_pts(vf.pts, tb);
+                                }
+                            }
                             if let Some(p) = vf.pts {
                                 self.last_video_pts = Some(p);
                             }
@@ -649,7 +679,14 @@ impl PlayerEngine {
             return;
         };
         let now = self.position();
-        while let Some(front) = self.video_queue.front() {
+        // Never discard the only frame we have. If decoding is slower than
+        // real time, dropping a singleton here means every frame can be
+        // thrown away before the renderer ever sees one. Drop stale backlog
+        // aggressively, but preserve the newest available frame for display.
+        while self.video_queue.len() > 1 {
+            let Some(front) = self.video_queue.front() else {
+                break;
+            };
             let pts_secs = front.pts.map(|p| tb.seconds_of(p)).unwrap_or(0.0);
             let target = Duration::from_secs_f64(pts_secs.max(0.0));
             if target + VIDEO_FRAME_MAX_BEHIND < now {
@@ -751,6 +788,37 @@ impl PlayerEngine {
         }
     }
 
+    /// Establish the initial media clock from the first timestamped
+    /// decoded frame when the sink-facing StreamInfo could not provide a
+    /// trustworthy start time up front. MPEG-TS is the important case:
+    /// its PMT is known at open, but its first PTS is only discovered while
+    /// PES packets are read. Snapshotting the driver's current raw clock
+    /// makes the frame that supplied this PTS due immediately rather than
+    /// waiting for an absolute transport-stream timestamp (often ~10 s or
+    /// much larger).
+    fn anchor_initial_clock_from_pts(&mut self, pts: Option<i64>, tb: oxideav_core::TimeBase) {
+        if self.initial_clock_anchored {
+            return;
+        }
+        let Some(pts) = pts else {
+            return;
+        };
+        let secs = tb.seconds_of(pts);
+        if !secs.is_finite() || secs < 0.0 {
+            return;
+        }
+        let raw = self.driver.master_clock_pos();
+        self.clock_baseline_samples = raw
+            .as_secs_f64()
+            .max(0.0)
+            .mul_add(self.audio_rate as f64, 0.0) as u64;
+        self.clock_origin = Duration::from_secs_f64(secs);
+        if self.audio_stream.is_some() {
+            self.last_audio_end = self.clock_origin;
+        }
+        self.initial_clock_anchored = true;
+    }
+
     fn apply_seek(&mut self, target: Duration) -> Result<()> {
         let (stream_idx, tb) = if let Some(v) = &self.video_stream {
             (v.index, v.time_base)
@@ -790,6 +858,7 @@ impl PlayerEngine {
             .max(0.0)
             .mul_add(self.audio_rate as f64, 0.0) as u64;
         self.clock_origin = landed;
+        self.initial_clock_anchored = true;
         // Bootstrap audio-end tracking from the announced anchor so
         // `audio_drained()` and the EOF heuristic stay correct after
         // the seek. The first post-barrier audio frame will add its
@@ -954,6 +1023,24 @@ impl ProfileBucket {
         }
         self.last_flush = Instant::now();
     }
+}
+
+/// Use a declared non-zero stream start time when one is already known at
+/// sink start. Audio wins because it is the player's master clock; video is
+/// the fallback for video-only playback. A declared zero is treated as
+/// "not yet anchored" because the pipeline currently uses zero as the
+/// synthetic default for demuxers (such as MPEG-TS) that discover PTS later.
+fn initial_declared_start(
+    audio: Option<&StreamInfo>,
+    video: Option<&StreamInfo>,
+) -> Option<Duration> {
+    let stream = audio.or(video)?;
+    let pts = stream.start_time?;
+    let secs = stream.time_base.seconds_of(pts);
+    if !secs.is_finite() || secs <= 0.0 {
+        return None;
+    }
+    Some(Duration::from_secs_f64(secs))
 }
 
 /// Compute the engine's wall-clock position from the four pieces of
@@ -1121,6 +1208,62 @@ mod tests {
             pos, landed,
             "saturating subtraction must clamp negative deltas to zero — \
              position should stay at the anchor, not wrap"
+        );
+    }
+
+    #[test]
+    fn declared_start_prefers_audio_master_and_ignores_synthetic_zero() {
+        use oxideav_core::{CodecId, CodecParameters, TimeBase};
+
+        let audio = StreamInfo {
+            index: 0,
+            time_base: TimeBase::new(1, 90_000),
+            duration: None,
+            start_time: Some(900_000),
+            params: CodecParameters::audio(CodecId::new("aac")),
+        };
+        let video = StreamInfo {
+            index: 1,
+            time_base: TimeBase::new(1, 90_000),
+            duration: None,
+            start_time: Some(902_999),
+            params: CodecParameters::video(CodecId::new("h264")),
+        };
+        assert_eq!(
+            initial_declared_start(Some(&audio), Some(&video)),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            initial_declared_start(None, Some(&video)),
+            Some(Duration::from_secs_f64(902_999.0 / 90_000.0))
+        );
+
+        let mut synthetic = video.clone();
+        synthetic.start_time = Some(0);
+        assert_eq!(initial_declared_start(None, Some(&synthetic)), None);
+    }
+
+    #[test]
+    fn late_discovered_initial_pts_can_be_due_immediately() {
+        let audio_rate = 48_000;
+        let raw_when_first_frame_arrives = Duration::from_millis(375);
+        let first_pts = Duration::from_secs_f64(902_999.0 / 90_000.0);
+        let baseline = (raw_when_first_frame_arrives.as_secs_f64() * audio_rate as f64) as u64;
+
+        let pos = position_from(
+            first_pts,
+            raw_when_first_frame_arrives,
+            baseline,
+            audio_rate,
+        );
+        let drift = if pos > first_pts {
+            pos - first_pts
+        } else {
+            first_pts - pos
+        };
+        assert!(
+            drift < Duration::from_micros(50),
+            "anchoring on the first late-discovered PTS must make that frame due immediately"
         );
     }
 

@@ -78,6 +78,6 @@ ringbuf = { version = "0.4", optional = true }
 # winit 0.30, matching the renderer above. egui-winit needs default
 # features off so it doesn't pull in clipboard / arboard, which drag
 # in C deps on Linux.
-egui = { version = "0.34", optional = true, default-features = false }
+egui = { version = "0.34", optional = true, default-features = false, features = ["default_fonts"] }
 egui-wgpu = { version = "0.34", optional = true, default-features = false, features = ["winit"] }
 egui-winit = { version = "0.34", optional = true, default-features = false, features = ["links"] }

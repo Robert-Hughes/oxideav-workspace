@@ -149,7 +149,11 @@ impl VideoRenderer {
             height: size.height.clamp(1, max_texture_dim),
             present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 2,
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode: if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+                wgpu::CompositeAlphaMode::Opaque
+            } else {
+                caps.alpha_modes[0]
+            },
             view_formats: vec![],
         };
         surface.configure(&device, &surface_cfg);
@@ -382,6 +386,19 @@ impl VideoRenderer {
     pub fn render(&mut self, frame: &VideoFrame) -> Result<()> {
         // Stream-level dims live on `src_*` (off CodecParameters), not
         // on the frame.
+        if (self.src_width == 0 || self.src_height == 0)
+            && self.src_format == PixelFormat::Yuv420P
+            && frame.planes.len() >= 3
+            && frame.planes[0].stride > 0
+        {
+            let w = frame.planes[0].stride as u32;
+            let h = (frame.planes[0].data.len() / frame.planes[0].stride) as u32;
+            if w > 0 && h > 0 {
+                self.src_width = w;
+                self.src_height = h;
+                eprintln!("oxideplay: inferred dynamic video size {w}x{h} from first frame");
+            }
+        }
         let src_w = self.src_width;
         let src_h = self.src_height;
         let src_fmt = self.src_format;

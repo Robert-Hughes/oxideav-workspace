@@ -298,19 +298,31 @@ fn select_video(
             crate::drivers::hash_engines::HashVideoEngine::new(),
         )));
     }
-    let Some(dims) = video_dims else {
-        return Ok(None);
-    };
+    // winit can start before the decoder has discovered dimensions
+    // (common for MPEG-TS/HLS). The renderer will learn them from the
+    // first decoded frame. SDL still requires dimensions up front.
+    #[cfg(feature = "winit")]
+    if name == "winit" {
+        return Ok(Some(Box::new(
+            crate::drivers::winit_vo::WinitVideoEngine::new(video_dims)?,
+        )));
+    }
+    if name == "auto" {
+        return auto_video(video_dims);
+    }
     match name {
-        "auto" => auto_video(dims),
+        "auto" => unreachable!(),
         #[cfg(feature = "winit")]
-        "winit" => Ok(Some(Box::new(
-            crate::drivers::winit_vo::WinitVideoEngine::new(Some(dims))?,
-        ))),
+        "winit" => unreachable!(),
         #[cfg(feature = "sdl2")]
-        "sdl2" => Ok(Some(Box::new(
-            crate::drivers::sdl2_video::SdlVideoEngine::new(dims)?,
-        ))),
+        "sdl2" => {
+            let Some(dims) = video_dims else {
+                return Ok(None);
+            };
+            Ok(Some(Box::new(
+                crate::drivers::sdl2_video::SdlVideoEngine::new(dims)?,
+            )))
+        }
         other => Err(oxideav_core::Error::invalid(format!(
             "--vo: unknown driver '{other}' (compiled in: {})",
             video_driver_list()
@@ -357,17 +369,19 @@ fn select_audio(
 }
 
 #[allow(unused_variables)]
-fn auto_video(dims: (u32, u32)) -> oxideav_core::Result<Option<Box<dyn VideoEngine>>> {
+fn auto_video(dims: Option<(u32, u32)>) -> oxideav_core::Result<Option<Box<dyn VideoEngine>>> {
     #[cfg(feature = "winit")]
     {
-        if let Ok(v) = crate::drivers::winit_vo::WinitVideoEngine::new(Some(dims)) {
+        if let Ok(v) = crate::drivers::winit_vo::WinitVideoEngine::new(dims) {
             return Ok(Some(Box::new(v)));
         }
     }
     #[cfg(feature = "sdl2")]
     {
-        if let Ok(v) = crate::drivers::sdl2_video::SdlVideoEngine::new(dims) {
-            return Ok(Some(Box::new(v)));
+        if let Some(dims) = dims {
+            if let Ok(v) = crate::drivers::sdl2_video::SdlVideoEngine::new(dims) {
+                return Ok(Some(Box::new(v)));
+            }
         }
     }
     Ok(None)
@@ -414,6 +428,17 @@ fn audio_driver_list() -> &'static str {
     }
 }
 
+fn normalise_playback_input(input: &str) -> String {
+    let lower = input.to_ascii_lowercase();
+    let path_end = lower.find(['?', '#']).unwrap_or(lower.len());
+    let path = &lower[..path_end];
+    if (lower.starts_with("https://") || lower.starts_with("http://")) && path.ends_with(".m3u8") {
+        format!("hls+{input}")
+    } else {
+        input.to_string()
+    }
+}
+
 fn run(cli: Cli) -> oxideav_core::Result<()> {
     if cli.dry_run {
         let mut registries = Registries::new();
@@ -422,7 +447,8 @@ fn run(cli: Cli) -> oxideav_core::Result<()> {
             .input
             .as_deref()
             .ok_or_else(|| oxideav_core::Error::invalid("dry-run requires an input path"))?;
-        return dry_run(&registries, &registries.sources, input);
+        let input = normalise_playback_input(input);
+        return dry_run(&registries, &registries.sources, &input);
     }
 
     let mut registries = Registries::new();
@@ -451,7 +477,7 @@ fn run(cli: Cli) -> oxideav_core::Result<()> {
             .input
             .as_deref()
             .ok_or_else(|| oxideav_core::Error::invalid("no input URI (pass a path or --job)"))?;
-        synthesise_playback_job(input, want_audio, want_video)?
+        synthesise_playback_job(&normalise_playback_input(input), want_audio, want_video)?
     };
 
     let job = Job::from_json(&job_json)?;
@@ -530,7 +556,9 @@ fn run(cli: Cli) -> oxideav_core::Result<()> {
     let track_info = if cli.inline.is_none() && cli.job.is_none() {
         cli.input
             .as_deref()
-            .map(|input| extract_track_info(&registries, input, duration))
+            .map(|input| {
+                extract_track_info(&registries, &normalise_playback_input(input), duration)
+            })
             .unwrap_or_default()
     } else {
         TrackInfo::default()
@@ -927,6 +955,18 @@ mod cli_tests {
         let cli = Cli::try_parse_from(["oxideplay", "--dry-run", "x.mp4"]).unwrap();
         assert!(cli.dry_run);
         assert_eq!(cli.input.as_deref(), Some("x.mp4"));
+    }
+
+    #[test]
+    fn normalises_http_m3u8_to_hls_source_scheme() {
+        assert_eq!(
+            normalise_playback_input("https://example.test/master.m3u8?token=x"),
+            "hls+https://example.test/master.m3u8?token=x"
+        );
+        assert_eq!(
+            normalise_playback_input("https://example.test/video.ts"),
+            "https://example.test/video.ts"
+        );
     }
 
     #[test]
