@@ -108,8 +108,19 @@ impl JobSink for ChannelSink {
                         hw.pts()
                     );
                 }
-            } else if frame.as_arena_video().is_some() {
+            } else if let Some(arena) = frame.as_arena_video() {
                 self.seen_video += 1;
+                if self.seen_video <= 5 || self.seen_video % 50 == 0 {
+                    let header = arena.header();
+                    eprintln!(
+                        "[sink] video frame #{} arena={:?} {}x{} pts={:?}",
+                        self.seen_video,
+                        header.pixel_format,
+                        header.width,
+                        header.height,
+                        header.presentation_timestamp
+                    );
+                }
             }
         }
         self.tx
@@ -231,6 +242,40 @@ mod tests {
             }
             _ => panic!("expected heap-backed retained frame leases"),
         }
+    }
+
+    #[test]
+    fn channel_sink_preserves_arena_cpu_lease_identity() {
+        use oxideav_core::arena::sync::{ArenaPool, FrameHeader, VideoFrameBuilder};
+
+        let pool = ArenaPool::new(1, 16);
+        let arena = pool.lease().expect("arena lease");
+        let mut builder = VideoFrameBuilder::<u8>::new(arena, &[4], &[2]).expect("builder");
+        builder
+            .plane_mut(0)
+            .expect("luma plane")
+            .copy_from_slice(&[1, 2, 3, 4]);
+        let frame = builder
+            .freeze(FrameHeader::new(2, 2, PixelFormat::Gray8, Some(5)))
+            .expect("freeze arena frame");
+        let retained_ptr = frame.plane(0).expect("retained plane").as_ptr();
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut sink = ChannelSink::new(tx);
+
+        sink.write_frame_lease(MediaType::Video, FrameLease::from_arena_video(frame))
+            .expect("send arena frame lease");
+        let EngineMsg::Frame { frame, .. } = rx.recv().expect("receive frame") else {
+            panic!("expected frame message");
+        };
+        let received = frame
+            .as_arena_video()
+            .expect("arena lease must reach engine unchanged");
+
+        assert_eq!(received.header().presentation_timestamp, Some(5));
+        assert_eq!(
+            received.plane(0).expect("received plane").as_ptr(),
+            retained_ptr
+        );
     }
 
     #[test]
