@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use oxideav_core::{CodecParameters, Error, Result, VideoFrame};
+use oxideav_core::{CodecParameters, Error, Frame, FrameLease, Result, VideoFrame};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -292,6 +292,33 @@ impl VideoEngine for WinitVideoEngine {
             v.render(frame)?;
         }
         Ok(())
+    }
+
+    fn present_lease(&mut self, frame: &FrameLease) -> Result<()> {
+        if let Some(arena) = frame.as_arena_video() {
+            let Some(video) = self.app.video.as_mut() else {
+                return Ok(());
+            };
+            if video.render_arena(arena)? {
+                return Ok(());
+            }
+        }
+
+        if let Some(frame) = frame.as_frame() {
+            return match frame {
+                Frame::Video(video) => self.present(video),
+                _ => Err(Error::invalid(
+                    "oxideplay: winit video engine received a non-video frame lease",
+                )),
+            };
+        }
+
+        match frame.materialize()? {
+            Frame::Video(video) => self.present(&video),
+            _ => Err(Error::invalid(
+                "oxideplay: winit video engine materialised a non-video frame",
+            )),
+        }
     }
 
     fn poll_events(&mut self) -> Vec<PlayerEvent> {

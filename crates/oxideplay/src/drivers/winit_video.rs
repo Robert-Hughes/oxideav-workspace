@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::drivers::video_convert::to_yuv420p;
 #[cfg(feature = "egui")]
 use crate::drivers::winit_overlay::OverlayUi;
+use oxideav_core::arena::sync::Frame as ArenaFrame;
 use oxideav_core::{CodecParameters, Error, PixelFormat, Result, VideoFrame};
 
 pub struct VideoRenderer {
@@ -383,6 +384,47 @@ impl VideoRenderer {
         self.surface.configure(&self.device, &self.surface_cfg);
     }
 
+    /// Present a native arena-backed YUV420P frame without materialising or
+    /// repacking its CPU planes. Returns `Ok(false)` when the arena cannot use
+    /// this direct path, allowing the caller to fall back to legacy conversion.
+    pub fn render_arena(&mut self, frame: &ArenaFrame) -> Result<bool> {
+        let Some(view) = arena_yuv420p_view(frame) else {
+            return Ok(false);
+        };
+
+        if view.width > self.max_texture_dim || view.height > self.max_texture_dim {
+            return Ok(false);
+        }
+        if self.src_format != PixelFormat::Yuv420P
+            || (self.src_width != 0 && self.src_width != view.width)
+            || (self.src_height != 0 && self.src_height != view.height)
+        {
+            return Ok(false);
+        }
+
+        self.src_format = PixelFormat::Yuv420P;
+        self.src_width = view.width;
+        self.src_height = view.height;
+        self.ensure_yuv_textures(view.width, view.height);
+        self.upload_plane(PlaneKind::Y, view.width, view.height, view.y_stride, view.y);
+        self.upload_plane(
+            PlaneKind::U,
+            view.width / 2,
+            view.height / 2,
+            view.u_stride,
+            view.u,
+        );
+        self.upload_plane(
+            PlaneKind::V,
+            view.width / 2,
+            view.height / 2,
+            view.v_stride,
+            view.v,
+        );
+        self.draw_uploaded_frame(view.width, view.height)?;
+        Ok(true)
+    }
+
     pub fn render(&mut self, frame: &VideoFrame) -> Result<()> {
         // Stream-level dims live on `src_*` (off CodecParameters), not
         // on the frame.
@@ -422,31 +464,32 @@ impl VideoRenderer {
             return Ok(());
         }
 
-        if self.dims != Some((plane_w, plane_h)) {
-            self.create_textures(plane_w, plane_h);
-            self.dims = Some((plane_w, plane_h));
+        self.ensure_yuv_textures(plane_w, plane_h);
+        self.upload_plane(PlaneKind::Y, plane_w, plane_h, plane_w, &y_data);
+        self.upload_plane(PlaneKind::U, plane_w / 2, plane_h / 2, plane_w / 2, &u_data);
+        self.upload_plane(PlaneKind::V, plane_w / 2, plane_h / 2, plane_w / 2, &v_data);
+        self.draw_uploaded_frame(src_w, src_h)
+    }
+
+    fn ensure_yuv_textures(&mut self, width: u32, height: u32) {
+        if self.dims != Some((width, height)) {
+            self.create_textures(width, height);
+            self.dims = Some((width, height));
         }
+    }
 
-        self.upload_plane(PlaneKind::Y, plane_w, plane_h, &y_data);
-        self.upload_plane(PlaneKind::U, plane_w / 2, plane_h / 2, &u_data);
-        self.upload_plane(PlaneKind::V, plane_w / 2, plane_h / 2, &v_data);
-
+    fn draw_uploaded_frame(&mut self, src_w: u32, src_h: u32) -> Result<()> {
         // Update the letterbox uniform so the shader scales the content
         // rectangle to fit the surface while preserving the source
         // aspect ratio (pillar bars for wide content in a tall window,
-        // letter bars for tall content in a wide window). We use the
-        // SOURCE aspect (src_w / src_h) rather than the potentially
-        // downsampled plane_w/plane_h so the content isn't squashed
-        // when we've had to downsample to fit the texture limit.
+        // letter bars for tall content in a wide window).
         let surface_aspect = self.surface_cfg.width as f32 / self.surface_cfg.height.max(1) as f32;
         let content_aspect = src_w as f32 / src_h.max(1) as f32;
         let (sx, sy, ox, oy) = if content_aspect > surface_aspect {
-            // Content is wider than surface — letterbox (black bars top/bottom).
             let h_frac = surface_aspect / content_aspect;
             let off_y = (1.0 - h_frac) * 0.5;
             (1.0, 1.0 / h_frac, 0.0, off_y)
         } else {
-            // Content is taller than surface (or matches) — pillarbox.
             let w_frac = content_aspect / surface_aspect;
             let off_x = (1.0 - w_frac) * 0.5;
             (1.0 / w_frac, 1.0, off_x, 0.0)
@@ -472,7 +515,6 @@ impl VideoRenderer {
                     }
                 }
             }
-            // Transient states — skip the frame, the next tick will retry.
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
                 return Ok(());
             }
@@ -512,9 +554,6 @@ impl VideoRenderer {
             }
         }
 
-        // Overlay paints into the same surface texture in a second
-        // render pass with `LoadOp::Load` so the YUV output stays
-        // intact underneath the egui meshes.
         #[cfg(feature = "egui")]
         if let Some(o) = self.overlay.as_mut() {
             let screen_size = (self.surface_cfg.width, self.surface_cfg.height);
@@ -643,7 +682,7 @@ impl VideoRenderer {
         })
     }
 
-    fn upload_plane(&self, kind: PlaneKind, w: u32, h: u32, data: &[u8]) {
+    fn upload_plane(&self, kind: PlaneKind, w: u32, h: u32, bytes_per_row: u32, data: &[u8]) {
         let Some(tex) = self.textures.as_ref() else {
             return;
         };
@@ -662,7 +701,7 @@ impl VideoRenderer {
             data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(w),
+                bytes_per_row: Some(bytes_per_row),
                 rows_per_image: Some(h),
             },
             wgpu::Extent3d {
@@ -678,6 +717,71 @@ enum PlaneKind {
     Y,
     U,
     V,
+}
+
+struct ArenaYuv420pView<'a> {
+    width: u32,
+    height: u32,
+    y: &'a [u8],
+    u: &'a [u8],
+    v: &'a [u8],
+    y_stride: u32,
+    u_stride: u32,
+    v_stride: u32,
+}
+
+fn arena_yuv420p_view(frame: &ArenaFrame) -> Option<ArenaYuv420pView<'_>> {
+    let header = frame.header();
+    let width = header.width;
+    let height = header.height;
+    if header.pixel_format != PixelFormat::Yuv420P
+        || width == 0
+        || height == 0
+        || width % 2 != 0
+        || height % 2 != 0
+        || frame.plane_count() < 3
+    {
+        return None;
+    }
+
+    let y = frame.plane(0)?;
+    let u = frame.plane(1)?;
+    let v = frame.plane(2)?;
+    let y_stride = frame.plane_stride(0)?;
+    let u_stride = frame.plane_stride(1)?;
+    let v_stride = frame.plane_stride(2)?;
+    let chroma_w = (width / 2) as usize;
+    let chroma_h = (height / 2) as usize;
+    let width = width as usize;
+    let height = height as usize;
+
+    if !plane_covers_image(y, y_stride, width, height)
+        || !plane_covers_image(u, u_stride, chroma_w, chroma_h)
+        || !plane_covers_image(v, v_stride, chroma_w, chroma_h)
+    {
+        return None;
+    }
+
+    Some(ArenaYuv420pView {
+        width: width as u32,
+        height: height as u32,
+        y,
+        u,
+        v,
+        y_stride: u32::try_from(y_stride).ok()?,
+        u_stride: u32::try_from(u_stride).ok()?,
+        v_stride: u32::try_from(v_stride).ok()?,
+    })
+}
+
+fn plane_covers_image(data: &[u8], stride: usize, row_bytes: usize, rows: usize) -> bool {
+    if stride < row_bytes || rows == 0 {
+        return false;
+    }
+    stride
+        .checked_mul(rows.saturating_sub(1))
+        .and_then(|prefix| prefix.checked_add(row_bytes))
+        .is_some_and(|required| data.len() >= required)
 }
 
 /// Prepare YUV 4:2:0 planes sized to fit within `max_dim`. If the source
@@ -751,4 +855,49 @@ fn box_downsample(src: &[u8], src_w: usize, src_h: usize, factor: usize) -> Vec<
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxideav_core::arena::sync::{ArenaPool, FrameHeader, VideoFrameBuilder};
+
+    #[test]
+    fn arena_yuv420p_view_borrows_original_planes_and_preserves_stride() {
+        let pool = ArenaPool::new(1, 64);
+        let arena = pool.lease().expect("arena lease");
+        let mut builder =
+            VideoFrameBuilder::<u8>::new(arena, &[24, 8, 8], &[6, 4, 4]).expect("builder");
+        builder
+            .plane_mut(0)
+            .expect("y")
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, v)| *v = i as u8);
+        let frame = builder
+            .freeze(FrameHeader::new(4, 4, PixelFormat::Yuv420P, Some(9)))
+            .expect("freeze");
+        let y_ptr = frame.plane(0).expect("y plane").as_ptr();
+        let u_ptr = frame.plane(1).expect("u plane").as_ptr();
+        let v_ptr = frame.plane(2).expect("v plane").as_ptr();
+
+        let view = arena_yuv420p_view(&frame).expect("direct arena view");
+        assert_eq!((view.width, view.height), (4, 4));
+        assert_eq!((view.y_stride, view.u_stride, view.v_stride), (6, 4, 4));
+        assert_eq!(view.y.as_ptr(), y_ptr);
+        assert_eq!(view.u.as_ptr(), u_ptr);
+        assert_eq!(view.v.as_ptr(), v_ptr);
+    }
+
+    #[test]
+    fn arena_yuv420p_view_rejects_non_yuv420p_storage() {
+        let pool = ArenaPool::new(1, 16);
+        let arena = pool.lease().expect("arena lease");
+        let builder = VideoFrameBuilder::<u8>::new(arena, &[4], &[2]).expect("builder");
+        let frame = builder
+            .freeze(FrameHeader::new(2, 2, PixelFormat::Gray8, None))
+            .expect("freeze");
+
+        assert!(arena_yuv420p_view(&frame).is_none());
+    }
 }
