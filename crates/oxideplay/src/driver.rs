@@ -5,7 +5,9 @@
 //! polls events from it, and asks it what the current master-clock position
 //! is (which is usually driven by the audio output rate).
 
-use oxideav_core::{AudioFrame, ChannelLayout, CodecParameters, Result, VideoFrame};
+use oxideav_core::{
+    AudioFrame, ChannelLayout, CodecParameters, Error, Frame, FrameLease, Result, VideoFrame,
+};
 use std::time::Duration;
 
 /// Snapshot of player state passed to the on-screen overlay each
@@ -82,6 +84,28 @@ pub trait OutputDriver {
     /// Present one decoded video frame. A headless/audio-only driver
     /// should simply discard the frame.
     fn present_video(&mut self, frame: &VideoFrame) -> Result<()>;
+
+    /// Present a retainable decoded-video lease. Heap-backed CPU frames are
+    /// borrowed directly with no media copy. Arena/hardware representations are
+    /// materialised only at this final driver boundary unless a lease-aware
+    /// renderer overrides the method.
+    fn present_video_lease(&mut self, frame: &FrameLease) -> Result<()> {
+        match frame.as_frame() {
+            Some(Frame::Video(video)) => return self.present_video(video),
+            Some(_) => {
+                return Err(Error::invalid(
+                    "oxideplay: video presentation received a non-video frame lease",
+                ))
+            }
+            None => {}
+        }
+        match frame.materialize()? {
+            Frame::Video(video) => self.present_video(&video),
+            _ => Err(Error::invalid(
+                "oxideplay: video presentation materialised a non-video frame",
+            )),
+        }
+    }
 
     /// Queue a decoded audio frame for playback. The driver is expected
     /// to own its audio callback and consume this buffer as samples are
@@ -171,6 +195,9 @@ pub trait OutputDriver {
 impl<D: OutputDriver + ?Sized> OutputDriver for Box<D> {
     fn present_video(&mut self, frame: &VideoFrame) -> Result<()> {
         (**self).present_video(frame)
+    }
+    fn present_video_lease(&mut self, frame: &FrameLease) -> Result<()> {
+        (**self).present_video_lease(frame)
     }
     fn queue_audio(&mut self, frame: &AudioFrame) -> Result<()> {
         (**self).queue_audio(frame)

@@ -28,7 +28,7 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use oxideav::pipeline::{BarrierKind, ExecutorHandle};
-use oxideav_core::{Error, Frame, MediaType, Result, StreamInfo, VideoFrame};
+use oxideav_core::{Error, Frame, FrameLease, MediaType, Result, StreamInfo};
 
 use crate::driver::{OutputDriver, OverlayState, PlayerEvent, SeekDir};
 use crate::media_controls::{MediaCommand, MediaControls, PlaybackState, TrackInfo};
@@ -59,13 +59,12 @@ pub enum EngineMsg {
     Started(Vec<StreamInfo>),
     /// One decoded frame ready for presentation. `kind` identifies
     /// the stream (audio / video / extras emitted by multi-port
-    /// filters like spectrogram). Synthesised playback jobs use
-    /// `MediaType::Unknown` — the engine dispatches on the `Frame`
-    /// variant instead, so `kind` is informational only.
+    /// filters like spectrogram). The owned lease preserves pooled CPU or
+    /// hardware storage across the executor/engine channel without copying.
     Frame {
         #[allow(dead_code)]
         kind: MediaType,
-        frame: Frame,
+        frame: FrameLease,
     },
     /// Flow barrier from the executor (today only `SeekFlush`).
     /// Engine drops in-flight buffers and re-anchors its clock.
@@ -90,9 +89,9 @@ pub struct PlayerEngine {
     audio_rate: u32,
 
     // ── A/V sync ────────────────────────────────────────
-    /// Decoded video frames pending presentation. Popped in
-    /// pts-order as wallclock catches up.
-    video_queue: VecDeque<VideoFrame>,
+    /// Decoded video-frame leases pending presentation. Popped in pts-order as
+    /// wallclock catches up; backing CPU/GPU storage remains retained in place.
+    video_queue: VecDeque<FrameLease>,
     /// Audio-pts duration of the *last* audio frame seen. Used as
     /// the master clock anchor.
     clock_origin: Duration,
@@ -526,45 +525,40 @@ impl PlayerEngine {
                         // Pre-barrier payload — drop it.
                         continue;
                     }
-                    // Dispatch on the Frame variant, not the MuxTrack's
-                    // declared kind: synthesised plain-playback uses
-                    // `@display: {all: [...]}` which resolves to
-                    // `MediaType::Unknown` while still emitting typed
-                    // audio / video frames.
-                    match frame {
-                        Frame::Audio(af) => {
-                            if !self.initial_clock_anchored {
-                                if let Some(tb) = self.audio_stream.as_ref().map(|s| s.time_base) {
-                                    self.anchor_initial_clock_from_pts(af.pts, tb);
-                                }
+                    // Audio currently uses the ordinary owned Frame variant;
+                    // video may instead be an arena-backed CPU frame or an
+                    // opaque hardware surface. Classify without materialising.
+                    if let Some(Frame::Audio(af)) = frame.as_frame() {
+                        if !self.initial_clock_anchored {
+                            if let Some(tb) = self.audio_stream.as_ref().map(|s| s.time_base) {
+                                self.anchor_initial_clock_from_pts(af.pts, tb);
                             }
-                            if self.audio_rate > 0 {
-                                self.last_audio_end += Duration::from_secs_f64(
-                                    af.samples as f64 / self.audio_rate as f64,
-                                );
-                            }
-                            self.driver.queue_audio(&af)?;
                         }
-                        Frame::Video(vf) => {
+                        if self.audio_rate > 0 {
+                            self.last_audio_end +=
+                                Duration::from_secs_f64(af.samples as f64 / self.audio_rate as f64);
+                        }
+                        self.driver.queue_audio(af)?;
+                    } else {
+                        let is_video = matches!(frame.as_frame(), Some(Frame::Video(_)))
+                            || frame.as_arena_video().is_some()
+                            || frame.is_hardware_video();
+                        if is_video {
+                            let pts = frame.pts();
                             if !self.initial_clock_anchored {
                                 if let Some(tb) = self.video_stream.as_ref().map(|s| s.time_base) {
-                                    self.anchor_initial_clock_from_pts(vf.pts, tb);
+                                    self.anchor_initial_clock_from_pts(pts, tb);
                                 }
                             }
-                            if let Some(p) = vf.pts {
+                            if let Some(p) = pts {
                                 self.last_video_pts = Some(p);
                             }
-                            // Decoders are responsible for emitting frames
-                            // in display (POC) order — see oxideav-h264
-                            // §C.4 bumping. Containers attach the
-                            // composition pts (CTS) to the matching
-                            // packet so the decoder doesn't need to
-                            // reorder timestamps either. Both the
-                            // real-time path and the hash sink can just
-                            // append in arrival order now.
-                            self.video_queue.push_back(vf);
+                            // Decoders emit display-order frames. Retain the
+                            // lease itself in the presentation queue so pooled
+                            // CPU storage or a GPU surface is not copied while
+                            // waiting for its PTS.
+                            self.video_queue.push_back(frame);
                         }
-                        _ => {}
                     }
                 }
                 EngineMsg::Barrier(BarrierKind::SeekFlush {
@@ -626,10 +620,10 @@ impl PlayerEngine {
         // deadline-driven sleep to wake us right before each frame's
         // target; if we're behind, the late-frame trim drops the stale
         // ones rather than dumping them all on the GPU at once.
-        let Some(vf) = self.video_queue.front() else {
+        let Some(frame) = self.video_queue.front() else {
             return Ok(());
         };
-        let pts_secs = match (vf.pts, video_tb) {
+        let pts_secs = match (frame.pts(), video_tb) {
             (Some(p), Some(tb)) => tb.seconds_of(p),
             _ => 0.0,
         };
@@ -639,9 +633,9 @@ impl PlayerEngine {
             Duration::ZERO
         };
         if target <= now + epsilon {
-            let vf = self.video_queue.pop_front().unwrap();
-            self.last_video_presented_pts = vf.pts;
-            self.driver.present_video(&vf)?;
+            let frame = self.video_queue.pop_front().unwrap();
+            self.last_video_presented_pts = frame.pts();
+            self.driver.present_video_lease(&frame)?;
         }
         Ok(())
     }
@@ -654,8 +648,8 @@ impl PlayerEngine {
     /// loop falls back to the routine 16 ms tick interval.
     fn next_video_target(&self) -> Option<Duration> {
         let tb = self.video_stream.as_ref().map(|s| s.time_base)?;
-        let vf = self.video_queue.front()?;
-        let p = vf.pts?;
+        let frame = self.video_queue.front()?;
+        let p = frame.pts()?;
         let secs = tb.seconds_of(p);
         if !secs.is_finite() || secs < 0.0 {
             return None;
@@ -667,9 +661,9 @@ impl PlayerEngine {
     /// without consulting the master clock. Used when the video
     /// engine has no real-time deadline (`--vo hash`).
     fn drain_video_queue(&mut self) -> Result<()> {
-        while let Some(vf) = self.video_queue.pop_front() {
-            self.last_video_presented_pts = vf.pts;
-            self.driver.present_video(&vf)?;
+        while let Some(frame) = self.video_queue.pop_front() {
+            self.last_video_presented_pts = frame.pts();
+            self.driver.present_video_lease(&frame)?;
         }
         Ok(())
     }
@@ -687,7 +681,7 @@ impl PlayerEngine {
             let Some(front) = self.video_queue.front() else {
                 break;
             };
-            let pts_secs = front.pts.map(|p| tb.seconds_of(p)).unwrap_or(0.0);
+            let pts_secs = front.pts().map(|p| tb.seconds_of(p)).unwrap_or(0.0);
             let target = Duration::from_secs_f64(pts_secs.max(0.0));
             if target + VIDEO_FRAME_MAX_BEHIND < now {
                 self.video_queue.pop_front();

@@ -10,7 +10,7 @@
 use std::sync::mpsc::SyncSender;
 
 use oxideav::pipeline::{BarrierKind, JobSink};
-use oxideav_core::{Error, Frame, MediaType, Packet, Result, StreamInfo};
+use oxideav_core::{Error, Frame, FrameLease, MediaType, Packet, Result, StreamInfo};
 
 use crate::engine::EngineMsg;
 
@@ -64,36 +64,56 @@ impl JobSink for ChannelSink {
     }
 
     fn write_frame(&mut self, kind: MediaType, frame: &Frame) -> Result<()> {
+        // Legacy compatibility path. The lease-aware pipeline calls
+        // `write_frame_lease` directly, so normal playback never deep-clones a
+        // decoded frame here.
+        self.write_frame_lease(kind, FrameLease::from_frame(frame.clone()))
+    }
+
+    fn write_frame_lease(&mut self, kind: MediaType, frame: FrameLease) -> Result<()> {
         if self.debug {
-            match frame {
-                Frame::Audio(af) => {
-                    self.seen_audio += 1;
-                    if self.seen_audio <= 5 || self.seen_audio % 50 == 0 {
-                        eprintln!(
-                            "[sink] audio frame #{} samples={} pts={:?}",
-                            self.seen_audio, af.samples, af.pts
-                        );
+            if let Some(frame) = frame.as_frame() {
+                match frame {
+                    Frame::Audio(af) => {
+                        self.seen_audio += 1;
+                        if self.seen_audio <= 5 || self.seen_audio % 50 == 0 {
+                            eprintln!(
+                                "[sink] audio frame #{} samples={} pts={:?}",
+                                self.seen_audio, af.samples, af.pts
+                            );
+                        }
                     }
-                }
-                Frame::Video(vf) => {
-                    self.seen_video += 1;
-                    if self.seen_video <= 5 || self.seen_video % 50 == 0 {
-                        eprintln!(
-                            "[sink] video frame #{} planes={} pts={:?}",
-                            self.seen_video,
-                            vf.planes.len(),
-                            vf.pts
-                        );
+                    Frame::Video(vf) => {
+                        self.seen_video += 1;
+                        if self.seen_video <= 5 || self.seen_video % 50 == 0 {
+                            eprintln!(
+                                "[sink] video frame #{} planes={} pts={:?}",
+                                self.seen_video,
+                                vf.planes.len(),
+                                vf.pts
+                            );
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
+            } else if let Some(hw) = frame.as_hardware_video() {
+                self.seen_video += 1;
+                if self.seen_video <= 5 || self.seen_video % 50 == 0 {
+                    eprintln!(
+                        "[sink] video frame #{} hardware={} {}x{} pts={:?}",
+                        self.seen_video,
+                        hw.backend(),
+                        hw.width(),
+                        hw.height(),
+                        hw.pts()
+                    );
+                }
+            } else if frame.as_arena_video().is_some() {
+                self.seen_video += 1;
             }
         }
         self.tx
-            .send(EngineMsg::Frame {
-                kind,
-                frame: frame.clone(),
-            })
+            .send(EngineMsg::Frame { kind, frame })
             .map_err(|_| Error::other("oxideplay: engine receiver dropped"))
     }
 
@@ -118,5 +138,119 @@ impl JobSink for ChannelSink {
         // cleanly.
         let _ = self.tx.send(EngineMsg::Finished);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::any::Any;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc};
+
+    use oxideav_core::{
+        HardwareVideoFrame, HardwareVideoFrameStorage, PixelFormat, VideoFrame, VideoPlane,
+    };
+
+    struct CountingHardwareStorage {
+        materializations: Arc<AtomicUsize>,
+    }
+
+    impl HardwareVideoFrameStorage for CountingHardwareStorage {
+        fn backend(&self) -> &'static str {
+            "test-hardware"
+        }
+
+        fn width(&self) -> u32 {
+            2
+        }
+
+        fn height(&self) -> u32 {
+            2
+        }
+
+        fn pixel_format(&self) -> PixelFormat {
+            PixelFormat::Yuv420P
+        }
+
+        fn pts(&self) -> Option<i64> {
+            Some(9)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn materialize(&self) -> Result<VideoFrame> {
+            self.materializations.fetch_add(1, Ordering::SeqCst);
+            Ok(VideoFrame {
+                pts: Some(9),
+                planes: vec![
+                    VideoPlane {
+                        stride: 2,
+                        data: vec![16; 4],
+                    },
+                    VideoPlane {
+                        stride: 1,
+                        data: vec![128],
+                    },
+                    VideoPlane {
+                        stride: 1,
+                        data: vec![128],
+                    },
+                ],
+            })
+        }
+    }
+
+    #[test]
+    fn channel_sink_preserves_owned_cpu_lease_identity() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut sink = ChannelSink::new(tx);
+        let lease = FrameLease::from_frame(Frame::Video(VideoFrame {
+            pts: Some(3),
+            planes: vec![VideoPlane {
+                stride: 2,
+                data: vec![1, 2, 3, 4],
+            }],
+        }));
+        let retained = lease.clone();
+
+        sink.write_frame_lease(MediaType::Video, lease)
+            .expect("send CPU frame lease");
+        let EngineMsg::Frame {
+            frame: received, ..
+        } = rx.recv().expect("receive frame")
+        else {
+            panic!("expected frame message");
+        };
+
+        match (&retained, &received) {
+            (FrameLease::Owned(before), FrameLease::Owned(after)) => {
+                assert!(Arc::ptr_eq(before, after));
+            }
+            _ => panic!("expected heap-backed retained frame leases"),
+        }
+    }
+
+    #[test]
+    fn channel_sink_does_not_materialize_hardware_lease() {
+        let materializations = Arc::new(AtomicUsize::new(0));
+        let lease =
+            FrameLease::from_hardware_video(HardwareVideoFrame::new(CountingHardwareStorage {
+                materializations: Arc::clone(&materializations),
+            }));
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut sink = ChannelSink::new(tx);
+
+        sink.write_frame_lease(MediaType::Video, lease)
+            .expect("send hardware frame lease");
+        let EngineMsg::Frame { frame, .. } = rx.recv().expect("receive frame") else {
+            panic!("expected frame message");
+        };
+
+        assert!(frame.is_hardware_video());
+        assert_eq!(frame.pts(), Some(9));
+        assert_eq!(materializations.load(Ordering::SeqCst), 0);
     }
 }

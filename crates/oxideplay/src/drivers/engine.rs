@@ -16,7 +16,9 @@
 
 use std::time::Duration;
 
-use oxideav_core::{AudioFrame, ChannelLayout, CodecParameters, Result, VideoFrame};
+use oxideav_core::{
+    AudioFrame, ChannelLayout, CodecParameters, Error, Frame, FrameLease, Result, VideoFrame,
+};
 
 use crate::driver::{OutputDriver, OverlayState, PlayerEvent};
 
@@ -25,6 +27,27 @@ use crate::driver::{OutputDriver, OverlayState, PlayerEvent};
 /// `--vo none`).
 pub trait VideoEngine: Send {
     fn present(&mut self, frame: &VideoFrame) -> Result<()>;
+
+    /// Present a decoded-video lease. Heap-backed CPU frames are borrowed
+    /// directly; arena/hardware representations materialise here only when the
+    /// concrete video engine does not override this method.
+    fn present_lease(&mut self, frame: &FrameLease) -> Result<()> {
+        match frame.as_frame() {
+            Some(Frame::Video(video)) => return self.present(video),
+            Some(_) => {
+                return Err(Error::invalid(
+                    "oxideplay: video engine received a non-video frame lease",
+                ))
+            }
+            None => {}
+        }
+        match frame.materialize()? {
+            Frame::Video(video) => self.present(&video),
+            _ => Err(Error::invalid(
+                "oxideplay: video engine materialised a non-video frame",
+            )),
+        }
+    }
     /// Drain any queued user-input events (keyboard, close button).
     /// Audio-only engines return an empty Vec.
     fn poll_events(&mut self) -> Vec<PlayerEvent> {
@@ -154,6 +177,13 @@ impl OutputDriver for Composite {
         }
     }
 
+    fn present_video_lease(&mut self, frame: &FrameLease) -> Result<()> {
+        match self.video.as_mut() {
+            Some(v) => v.present_lease(frame),
+            None => Ok(()),
+        }
+    }
+
     fn queue_audio(&mut self, frame: &AudioFrame) -> Result<()> {
         match self.audio.as_mut() {
             Some(a) => a.queue(frame),
@@ -261,3 +291,101 @@ impl OutputDriver for Composite {
 
 // `--vo none` and `--ao none` are handled by passing `None` for the
 // respective slot in `Composite`; no stub engine needed.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use oxideav_core::{Frame, VideoPlane};
+
+    struct LeaseAwareVideoEngine {
+        lease_called: Arc<AtomicBool>,
+        legacy_called: Arc<AtomicBool>,
+    }
+
+    impl VideoEngine for LeaseAwareVideoEngine {
+        fn present(&mut self, _frame: &VideoFrame) -> Result<()> {
+            self.legacy_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn present_lease(&mut self, frame: &FrameLease) -> Result<()> {
+            assert!(matches!(frame.as_frame(), Some(Frame::Video(_))));
+            self.lease_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn composite_forwards_video_lease_without_using_legacy_present() {
+        let lease_called = Arc::new(AtomicBool::new(false));
+        let legacy_called = Arc::new(AtomicBool::new(false));
+        let engine = LeaseAwareVideoEngine {
+            lease_called: Arc::clone(&lease_called),
+            legacy_called: Arc::clone(&legacy_called),
+        };
+        let mut composite = Composite::new(Some(Box::new(engine)), None);
+        let lease = FrameLease::from_frame(Frame::Video(VideoFrame {
+            pts: Some(1),
+            planes: vec![VideoPlane {
+                stride: 1,
+                data: vec![0],
+            }],
+        }));
+
+        composite
+            .present_video_lease(&lease)
+            .expect("lease-aware video presentation");
+
+        assert!(lease_called.load(Ordering::SeqCst));
+        assert!(!legacy_called.load(Ordering::SeqCst));
+    }
+
+    struct BorrowCheckingVideoEngine {
+        expected_ptr: usize,
+        saw_same_buffer: Arc<AtomicBool>,
+    }
+
+    impl VideoEngine for BorrowCheckingVideoEngine {
+        fn present(&mut self, frame: &VideoFrame) -> Result<()> {
+            let ptr = frame
+                .planes
+                .first()
+                .expect("test video plane")
+                .data
+                .as_ptr() as usize;
+            self.saw_same_buffer
+                .store(ptr == self.expected_ptr, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn default_video_engine_adapter_borrows_owned_cpu_frame_without_copy() {
+        let lease = FrameLease::from_frame(Frame::Video(VideoFrame {
+            pts: Some(2),
+            planes: vec![VideoPlane {
+                stride: 2,
+                data: vec![1, 2, 3, 4],
+            }],
+        }));
+        let expected_ptr = match lease.as_frame() {
+            Some(Frame::Video(video)) => video.planes[0].data.as_ptr() as usize,
+            _ => panic!("expected owned video lease"),
+        };
+        let saw_same_buffer = Arc::new(AtomicBool::new(false));
+        let engine = BorrowCheckingVideoEngine {
+            expected_ptr,
+            saw_same_buffer: Arc::clone(&saw_same_buffer),
+        };
+        let mut composite = Composite::new(Some(Box::new(engine)), None);
+
+        composite
+            .present_video_lease(&lease)
+            .expect("borrowed CPU presentation");
+
+        assert!(saw_same_buffer.load(Ordering::SeqCst));
+    }
+}
