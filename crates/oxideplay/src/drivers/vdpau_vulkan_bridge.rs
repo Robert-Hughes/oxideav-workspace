@@ -24,6 +24,7 @@ use wgpu::hal::api::Vulkan;
 use x11_dl::{glx, xlib};
 
 const GL_HANDLE_TYPE_OPAQUE_FD_EXT: u32 = 0x9586;
+const GL_DEDICATED_MEMORY_OBJECT_EXT: u32 = 0x9581;
 const GL_READ_ONLY: u32 = 0x88B8;
 
 type GlVdpauInitNv = unsafe extern "C" fn(*const c_void, *const c_void);
@@ -36,6 +37,7 @@ type GlVdpauUnmapSurfacesNv = unsafe extern "C" fn(i32, *const isize);
 type GlVdpauUnregisterSurfaceNv = unsafe extern "C" fn(isize);
 type GlCreateMemoryObjectsExt = unsafe extern "C" fn(i32, *mut u32);
 type GlDeleteMemoryObjectsExt = unsafe extern "C" fn(i32, *const u32);
+type GlMemoryObjectParameterivExt = unsafe extern "C" fn(u32, u32, *const i32);
 type GlImportMemoryFdExt = unsafe extern "C" fn(u32, u64, u32, i32);
 type GlTextureStorageMem2dExt = unsafe extern "C" fn(u32, i32, u32, i32, i32, u32, u64);
 type GlSignalVkSemaphoreNv = unsafe extern "C" fn(u64);
@@ -51,6 +53,7 @@ struct ExtFns {
     vdpau_unregister: GlVdpauUnregisterSurfaceNv,
     create_memory_objects: GlCreateMemoryObjectsExt,
     delete_memory_objects: GlDeleteMemoryObjectsExt,
+    memory_object_parameter_iv: GlMemoryObjectParameterivExt,
     import_memory_fd: GlImportMemoryFdExt,
     texture_storage_mem_2d: GlTextureStorageMem2dExt,
     signal_vk_semaphore: GlSignalVkSemaphoreNv,
@@ -415,6 +418,12 @@ impl VdpauVulkanBridge {
                     "VDPAU bridge glCreateMemoryObjectsEXT returned zero",
                 ));
             }
+            // Vulkan allocated this image with VkMemoryDedicatedAllocateInfo;
+            // GL must be told that the imported FD is dedicated to the texture
+            // before glImportMemoryFdEXT, otherwise NVIDIA accepts the import but
+            // writes to the framebuffer are not visible in the shared image.
+            let dedicated = 1i32;
+            (ext.memory_object_parameter_iv)(gl_memory, GL_DEDICATED_MEMORY_OBJECT_EXT, &dedicated);
             (ext.import_memory_fd)(
                 gl_memory,
                 memory_req.size,
@@ -845,6 +854,10 @@ impl ExtFns {
             vdpau_unregister: load!("glVDPAUUnregisterSurfaceNV", GlVdpauUnregisterSurfaceNv),
             create_memory_objects: load!("glCreateMemoryObjectsEXT", GlCreateMemoryObjectsExt),
             delete_memory_objects: load!("glDeleteMemoryObjectsEXT", GlDeleteMemoryObjectsExt),
+            memory_object_parameter_iv: load!(
+                "glMemoryObjectParameterivEXT",
+                GlMemoryObjectParameterivExt
+            ),
             import_memory_fd: load!("glImportMemoryFdEXT", GlImportMemoryFdExt),
             texture_storage_mem_2d: load!("glTextureStorageMem2DEXT", GlTextureStorageMem2dExt),
             signal_vk_semaphore: load!("glSignalVkSemaphoreNV", GlSignalVkSemaphoreNv),
