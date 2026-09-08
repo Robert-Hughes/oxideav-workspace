@@ -19,7 +19,23 @@ use oxideav_core::{CodecParameters, Error, PixelFormat, Result, VideoFrame};
 use oxideav_vdpau::VdpauVideoFrameStorage;
 
 #[cfg(target_os = "freebsd")]
-use oxideav_core::HardwareVideoFrameStorage;
+use oxideav_core::{HardwareVideoFrame, HardwareVideoFrameStorage};
+
+#[cfg(target_os = "freebsd")]
+const VDPAU_BRIDGE_SLOTS: usize = 4;
+
+#[cfg(target_os = "freebsd")]
+fn first_ready_slot<E>(
+    slot_count: usize,
+    mut poll: impl FnMut(usize) -> std::result::Result<bool, E>,
+) -> std::result::Result<Option<usize>, E> {
+    for index in 0..slot_count {
+        if poll(index)? {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
 
 pub struct VideoRenderer {
     device: wgpu::Device,
@@ -34,11 +50,13 @@ pub struct VideoRenderer {
     #[cfg(target_os = "freebsd")]
     rgba_bind_group_layout: wgpu::BindGroupLayout,
     #[cfg(target_os = "freebsd")]
-    vdpau_bridge: Option<VdpauVulkanBridge>,
+    vdpau_bridges: Vec<VdpauVulkanBridge>,
     #[cfg(target_os = "freebsd")]
-    vdpau_bind_group: Option<wgpu::BindGroup>,
+    vdpau_bind_groups: Vec<wgpu::BindGroup>,
     #[cfg(target_os = "freebsd")]
     vdpau_bridge_disabled: bool,
+    #[cfg(target_os = "freebsd")]
+    vdpau_busy_drops: u64,
     sampler: wgpu::Sampler,
     /// The window we render into. Kept so the overlay can ask for
     /// scale factor + winit input each frame.
@@ -409,11 +427,13 @@ impl VideoRenderer {
             #[cfg(target_os = "freebsd")]
             rgba_bind_group_layout,
             #[cfg(target_os = "freebsd")]
-            vdpau_bridge: None,
+            vdpau_bridges: Vec::new(),
             #[cfg(target_os = "freebsd")]
-            vdpau_bind_group: None,
+            vdpau_bind_groups: Vec::new(),
             #[cfg(target_os = "freebsd")]
             vdpau_bridge_disabled: false,
+            #[cfg(target_os = "freebsd")]
+            vdpau_busy_drops: 0,
             sampler,
             window,
             #[cfg(feature = "egui")]
@@ -535,12 +555,15 @@ impl VideoRenderer {
     }
 
     #[cfg(target_os = "freebsd")]
-    pub fn render_vdpau(&mut self, frame: &VdpauVideoFrameStorage) -> Result<bool> {
+    pub fn render_vdpau(&mut self, frame: &HardwareVideoFrame) -> Result<bool> {
         if self.vdpau_bridge_disabled {
             return Ok(false);
         }
-        let width = frame.width();
-        let height = frame.height();
+        let Some(storage) = frame.downcast_ref::<VdpauVideoFrameStorage>() else {
+            return Ok(false);
+        };
+        let width = storage.width();
+        let height = storage.height();
         if width == 0
             || height == 0
             || width > self.max_texture_dim
@@ -550,62 +573,88 @@ impl VideoRenderer {
         }
 
         let rebuild = self
-            .vdpau_bridge
-            .as_ref()
+            .vdpau_bridges
+            .first()
             .map_or(true, |bridge| bridge.dimensions() != (width, height));
         if rebuild {
-            match VdpauVulkanBridge::new(&self.device, &self.queue, width, height) {
-                Ok(bridge) => {
-                    let view = bridge
-                        .output_texture()
-                        .create_view(&wgpu::TextureViewDescriptor::default());
-                    let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("vdpau-rgba-bg"),
-                        layout: &self.rgba_bind_group_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::TextureView(&view),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::Sampler(&self.sampler),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: self.uniform_buffer.as_entire_binding(),
-                            },
-                        ],
-                    });
-                    drop(view);
-                    self.vdpau_bridge = Some(bridge);
-                    self.vdpau_bind_group = Some(bind_group);
-                    eprintln!(
-                        "oxideplay: VDPAU GPU bridge active (GLX interop2 -> Vulkan, {}x{})",
-                        width, height
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "oxideplay: VDPAU GPU bridge unavailable ({e}); falling back to CPU materialisation"
-                    );
-                    self.vdpau_bridge_disabled = true;
-                    return Ok(false);
-                }
+            self.vdpau_bridges.clear();
+            self.vdpau_bind_groups.clear();
+            for _ in 0..VDPAU_BRIDGE_SLOTS {
+                let bridge = match VdpauVulkanBridge::new(&self.device, &self.queue, width, height)
+                {
+                    Ok(bridge) => bridge,
+                    Err(e) => {
+                        eprintln!(
+                            "oxideplay: VDPAU GPU bridge unavailable ({e}); falling back to CPU materialisation"
+                        );
+                        self.vdpau_bridges.clear();
+                        self.vdpau_bind_groups.clear();
+                        self.vdpau_bridge_disabled = true;
+                        return Ok(false);
+                    }
+                };
+                let view = bridge
+                    .output_texture()
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("vdpau-rgba-bg"),
+                    layout: &self.rgba_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.uniform_buffer.as_entire_binding(),
+                        },
+                    ],
+                });
+                drop(view);
+                self.vdpau_bridges.push(bridge);
+                self.vdpau_bind_groups.push(bind_group);
             }
+            self.vdpau_busy_drops = 0;
+            eprintln!(
+                "oxideplay: VDPAU GPU bridge active (GLX interop2 -> Vulkan, {}x{}, {} async slots)",
+                width, height, VDPAU_BRIDGE_SLOTS
+            );
         }
 
-        let copy_result = self
-            .vdpau_bridge
-            .as_mut()
-            .expect("bridge was created above")
-            .copy_from_vdpau(frame);
-        if let Err(e) = copy_result {
+        let slot = match first_ready_slot(self.vdpau_bridges.len(), |index| {
+            self.vdpau_bridges[index].is_available()
+        }) {
+            Ok(slot) => slot,
+            Err(e) => {
+                eprintln!(
+                    "oxideplay: VDPAU GPU bridge fence polling failed ({e}); falling back to CPU materialisation"
+                );
+                self.vdpau_bridges.clear();
+                self.vdpau_bind_groups.clear();
+                self.vdpau_bridge_disabled = true;
+                return Ok(false);
+            }
+        };
+        let Some(slot) = slot else {
+            self.vdpau_busy_drops += 1;
+            if self.vdpau_busy_drops == 1 || self.vdpau_busy_drops % 120 == 0 {
+                eprintln!(
+                    "oxideplay: all {VDPAU_BRIDGE_SLOTS} VDPAU GPU slots are in flight; dropping video frame without CPU fallback"
+                );
+            }
+            return Ok(true);
+        };
+
+        if let Err(e) = self.vdpau_bridges[slot].copy_from_vdpau(frame.clone()) {
             eprintln!(
                 "oxideplay: VDPAU GPU bridge failed ({e}); falling back to CPU materialisation"
             );
-            self.vdpau_bridge = None;
-            self.vdpau_bind_group = None;
+            self.vdpau_bridges.clear();
+            self.vdpau_bind_groups.clear();
             self.vdpau_bridge_disabled = true;
             return Ok(false);
         }
@@ -613,10 +662,8 @@ impl VideoRenderer {
         self.src_format = PixelFormat::Yuv420P;
         self.src_width = width;
         self.src_height = height;
-        if self.draw_vdpau_frame(width, height)? {
-            if let Some(bridge) = self.vdpau_bridge.as_mut() {
-                bridge.mark_sampled();
-            }
+        if self.draw_vdpau_frame(width, height, slot)? {
+            self.vdpau_bridges[slot].mark_sampled();
         }
         Ok(true)
     }
@@ -769,7 +816,7 @@ impl VideoRenderer {
     }
 
     #[cfg(target_os = "freebsd")]
-    fn draw_vdpau_frame(&mut self, src_w: u32, src_h: u32) -> Result<bool> {
+    fn draw_vdpau_frame(&mut self, src_w: u32, src_h: u32, slot: usize) -> Result<bool> {
         let surface_aspect = self.surface_cfg.width as f32 / self.surface_cfg.height.max(1) as f32;
         let content_aspect = src_w as f32 / src_h.max(1) as f32;
         let (sx, sy, ox, oy) = if content_aspect > surface_aspect {
@@ -835,7 +882,7 @@ impl VideoRenderer {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.rgba_pipeline);
-            if let Some(bg) = self.vdpau_bind_group.as_ref() {
+            if let Some(bg) = self.vdpau_bind_groups.get(slot) {
                 pass.set_bind_group(0, bg, &[]);
                 pass.draw(0..3, 0..1);
             }
@@ -1186,5 +1233,32 @@ mod tests {
             .expect("freeze");
 
         assert!(arena_yuv420p_view(&frame).is_none());
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn first_ready_slot_returns_none_without_blocking_when_all_slots_are_busy() {
+        let mut polls = 0;
+        let slot = first_ready_slot(VDPAU_BRIDGE_SLOTS, |_| {
+            polls += 1;
+            Ok::<bool, ()>(false)
+        })
+        .expect("slot poll");
+        assert_eq!(slot, None);
+        assert_eq!(polls, VDPAU_BRIDGE_SLOTS);
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn first_ready_slot_stops_at_first_completed_slot() {
+        let states = [false, false, true, true];
+        let mut polls = 0;
+        let slot = first_ready_slot(states.len(), |index| {
+            polls += 1;
+            Ok::<bool, ()>(states[index])
+        })
+        .expect("slot poll");
+        assert_eq!(slot, Some(2));
+        assert_eq!(polls, 3);
     }
 }

@@ -7,17 +7,18 @@
 //! normal wgpu-owned RGBA texture, so wgpu's resource tracker never has to own
 //! or reason about the externally-written image.
 //!
-//! This first implementation deliberately favours correctness over throughput:
-//! GL completion and the raw Vulkan copy fence are waited synchronously before
-//! the frame lease may be released. There is still no CPU pixel readback or
-//! upload. The waits and final Vulkan copy can be pipelined/removed later.
+//! Steady-state presentation is fully pipelined. Each bridge slot retains its
+//! hardware-frame lease until a non-blocking Vulkan fence poll proves the
+//! GL-dependent copy has completed; GL/Vulkan ordering uses GPU semaphores and
+//! command submission only. There is no CPU pixel readback/upload, `glFinish`, or
+//! per-frame fence wait. The final GPU image copy remains a later optimisation.
 
 use std::ffi::{c_void, CString};
 use std::ptr;
 
 use ash::vk::{self, Handle};
 use glow::HasContext;
-use oxideav_core::{Error, HardwareVideoFrameStorage, Result};
+use oxideav_core::{Error, HardwareVideoFrame, HardwareVideoFrameStorage, Result};
 use oxideav_vdpau::VdpauVideoFrameStorage;
 use wgpu::hal::api::Vulkan;
 use x11_dl::{glx, xlib};
@@ -38,6 +39,7 @@ type GlDeleteMemoryObjectsExt = unsafe extern "C" fn(i32, *const u32);
 type GlImportMemoryFdExt = unsafe extern "C" fn(u32, u64, u32, i32);
 type GlTextureStorageMem2dExt = unsafe extern "C" fn(u32, i32, u32, i32, i32, u32, u64);
 type GlSignalVkSemaphoreNv = unsafe extern "C" fn(u64);
+type GlWaitVkSemaphoreNv = unsafe extern "C" fn(u64);
 
 struct ExtFns {
     vdpau_init: GlVdpauInitNv,
@@ -52,6 +54,16 @@ struct ExtFns {
     import_memory_fd: GlImportMemoryFdExt,
     texture_storage_mem_2d: GlTextureStorageMem2dExt,
     signal_vk_semaphore: GlSignalVkSemaphoreNv,
+    wait_vk_semaphore: GlWaitVkSemaphoreNv,
+}
+
+struct InFlightFrame {
+    // Owns the hardware storage until the GL read and dependent Vulkan copy
+    // have completed. The field is intentionally retained for lifetime only.
+    _frame: HardwareVideoFrame,
+    interop: isize,
+    y: glow::NativeTexture,
+    uv: glow::NativeTexture,
 }
 
 pub struct VdpauVulkanBridge {
@@ -69,6 +81,8 @@ pub struct VdpauVulkanBridge {
     command_buffer: vk::CommandBuffer,
     copy_fence: vk::Fence,
     gl_done: vk::Semaphore,
+    vk_ready: vk::Semaphore,
+    source_ready_wait_queued: bool,
 
     xlib: xlib::Xlib,
     glx: glx::Glx,
@@ -83,6 +97,7 @@ pub struct VdpauVulkanBridge {
     program: glow::NativeProgram,
     vao: glow::NativeVertexArray,
     vdpau_device: Option<(u32, usize)>,
+    inflight: Option<InFlightFrame>,
 }
 
 impl VdpauVulkanBridge {
@@ -218,27 +233,33 @@ impl VdpauVulkanBridge {
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let command_pool = unsafe { vk_device.create_command_pool(&pool_info, None) }
             .map_err(|e| Error::other(format!("VDPAU bridge vkCreateCommandPool: {e}")))?;
-        let command_buffer = unsafe {
+        let command_buffers = unsafe {
             vk_device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
                     .command_pool(command_pool)
                     .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
+                    .command_buffer_count(2),
             )
         }
-        .map_err(|e| Error::other(format!("VDPAU bridge vkAllocateCommandBuffers: {e}")))?[0];
+        .map_err(|e| Error::other(format!("VDPAU bridge vkAllocateCommandBuffers: {e}")))?;
+        let init_command_buffer = command_buffers[0];
+        let command_buffer = command_buffers[1];
         let copy_fence = unsafe { vk_device.create_fence(&vk::FenceCreateInfo::default(), None) }
             .map_err(|e| Error::other(format!("VDPAU bridge vkCreateFence: {e}")))?;
         let gl_done =
             unsafe { vk_device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
                 .map_err(|e| Error::other(format!("VDPAU bridge vkCreateSemaphore: {e}")))?;
+        let vk_ready =
+            unsafe { vk_device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
+                .map_err(|e| Error::other(format!("VDPAU bridge vkCreateSemaphore: {e}")))?;
 
-        // Establish GENERAL once. GL writes this same allocation on every frame;
-        // Vulkan only ever reads it as TRANSFER_SRC in GENERAL.
+        // Establish GENERAL once without stalling the CPU. The init submit
+        // signals `vk_ready`; the first GL command stream enqueues a
+        // glWaitVkSemaphoreNV before writing the shared allocation.
         unsafe {
             vk_device
                 .begin_command_buffer(
-                    command_buffer,
+                    init_command_buffer,
                     &vk::CommandBufferBeginInfo::default()
                         .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                 )
@@ -253,7 +274,7 @@ impl VdpauVulkanBridge {
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::MEMORY_READ);
             vk_device.cmd_pipeline_barrier(
-                command_buffer,
+                init_command_buffer,
                 vk::PipelineStageFlags::TOP_OF_PIPE,
                 vk::PipelineStageFlags::ALL_COMMANDS,
                 vk::DependencyFlags::empty(),
@@ -262,24 +283,16 @@ impl VdpauVulkanBridge {
                 &[barrier],
             );
             vk_device
-                .end_command_buffer(command_buffer)
+                .end_command_buffer(init_command_buffer)
                 .map_err(|e| Error::other(format!("VDPAU bridge end init command: {e}")))?;
+            let init_commands = [init_command_buffer];
+            let init_signals = [vk_ready];
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(&init_commands)
+                .signal_semaphores(&init_signals);
             vk_device
-                .queue_submit(
-                    vk_queue,
-                    &[vk::SubmitInfo::default().command_buffers(&[command_buffer])],
-                    copy_fence,
-                )
+                .queue_submit(vk_queue, &[submit], vk::Fence::null())
                 .map_err(|e| Error::other(format!("VDPAU bridge submit init command: {e}")))?;
-            vk_device
-                .wait_for_fences(&[copy_fence], true, u64::MAX)
-                .map_err(|e| Error::other(format!("VDPAU bridge wait init fence: {e}")))?;
-            vk_device
-                .reset_fences(&[copy_fence])
-                .map_err(|e| Error::other(format!("VDPAU bridge reset init fence: {e}")))?;
-            vk_device
-                .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
-                .map_err(|e| Error::other(format!("VDPAU bridge reset init command: {e}")))?;
         }
 
         let external_memory = ash::khr::external_memory_fd::Device::new(&instance, &vk_device);
@@ -480,6 +493,8 @@ impl VdpauVulkanBridge {
             command_buffer,
             copy_fence,
             gl_done,
+            vk_ready,
+            source_ready_wait_queued: false,
             xlib,
             glx,
             display,
@@ -493,6 +508,7 @@ impl VdpauVulkanBridge {
             program,
             vao,
             vdpau_device: None,
+            inflight: None,
         })
     }
 
@@ -511,12 +527,42 @@ impl VdpauVulkanBridge {
         self.output_sampled = true;
     }
 
-    pub fn copy_from_vdpau(&mut self, frame: &VdpauVideoFrameStorage) -> Result<()> {
-        if frame.width() != self.width || frame.height() != self.height {
+    /// Poll this slot without blocking. A signalled copy fence means Vulkan has
+    /// consumed the GL semaphore, so the GL shader has finished reading the
+    /// retained VDPAU surface and its interop registration can be retired.
+    pub fn is_available(&mut self) -> Result<bool> {
+        if self.inflight.is_none() {
+            return Ok(true);
+        }
+        match unsafe { self.vk_device.get_fence_status(self.copy_fence) } {
+            Ok(true) => {
+                self.retire_inflight()?;
+                Ok(true)
+            }
+            Ok(false) => Ok(false),
+            Err(e) => Err(Error::other(format!("VDPAU bridge query copy fence: {e}"))),
+        }
+    }
+
+    /// Submit one retained hardware frame into this slot. The method never waits
+    /// for GL or Vulkan completion: ownership is held in `inflight` until a later
+    /// non-blocking `is_available()` poll observes the copy fence.
+    pub fn copy_from_vdpau(&mut self, frame: HardwareVideoFrame) -> Result<()> {
+        if !self.is_available()? {
+            return Err(Error::other("VDPAU bridge slot is still in flight"));
+        }
+        let storage = frame
+            .downcast_ref::<VdpauVideoFrameStorage>()
+            .ok_or_else(|| Error::invalid("VDPAU bridge received non-VDPAU hardware storage"))?;
+        if storage.width() != self.width || storage.height() != self.height {
             return Err(Error::invalid("VDPAU bridge/frame dimension mismatch"));
         }
         self.make_current()?;
-        self.ensure_vdpau(frame)?;
+        self.ensure_vdpau(storage)?;
+        if !self.source_ready_wait_queued {
+            unsafe { (self.ext.wait_vk_semaphore)(self.vk_ready.as_raw()) };
+            self.source_ready_wait_queued = true;
+        }
 
         let y = unsafe { self.gl.create_texture() }
             .map_err(|e| Error::other(format!("VDPAU bridge create Y texture: {e}")))?;
@@ -528,7 +574,7 @@ impl VdpauVulkanBridge {
             }
         };
         let texture_names = [y.0.get(), uv.0.get()];
-        let raw_surface = frame.raw_surface() as usize as *const c_void;
+        let raw_surface = storage.raw_surface() as usize as *const c_void;
         let interop = unsafe {
             (self.ext.vdpau_register_frame)(
                 raw_surface,
@@ -568,19 +614,34 @@ impl VdpauVulkanBridge {
 
             self.gl.draw_arrays(glow::TRIANGLES, 0, 3);
             (self.ext.signal_vk_semaphore)(self.gl_done.as_raw());
-
-            // The lease may return its VdpVideoSurface to the decoder pool as
-            // soon as this method returns. Wait until the GL shader has really
-            // finished reading it before unmapping/unregistering.
-            self.gl.finish();
-            (self.ext.vdpau_unmap)(1, &interop);
-            (self.ext.vdpau_unregister)(interop);
-            self.gl.delete_texture(y);
-            self.gl.delete_texture(uv);
+            // Flush submits the command stream to the driver but does not wait.
+            // Vulkan's semaphore wait establishes the actual GPU dependency.
+            self.gl.flush();
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         }
         gl_check(&self.gl, "VDPAU interop render")?;
+
+        self.inflight = Some(InFlightFrame {
+            _frame: frame,
+            interop,
+            y,
+            uv,
+        });
         self.submit_vulkan_copy()
+    }
+
+    fn retire_inflight(&mut self) -> Result<()> {
+        let Some(inflight) = self.inflight.take() else {
+            return Ok(());
+        };
+        self.make_current()?;
+        unsafe {
+            (self.ext.vdpau_unmap)(1, &inflight.interop);
+            (self.ext.vdpau_unregister)(inflight.interop);
+            self.gl.delete_texture(inflight.y);
+            self.gl.delete_texture(inflight.uv);
+        }
+        gl_check(&self.gl, "retire VDPAU interop surface")
     }
 
     fn make_current(&self) -> Result<()> {
@@ -711,9 +772,6 @@ impl VdpauVulkanBridge {
             self.vk_device
                 .queue_submit(self.vk_queue, &[submit], self.copy_fence)
                 .map_err(|e| Error::other(format!("VDPAU bridge submit copy: {e}")))?;
-            self.vk_device
-                .wait_for_fences(&[self.copy_fence], true, u64::MAX)
-                .map_err(|e| Error::other(format!("VDPAU bridge wait copy fence: {e}")))?;
         }
         Ok(())
     }
@@ -723,10 +781,13 @@ impl Drop for VdpauVulkanBridge {
     fn drop(&mut self) {
         let _ = self.make_current();
         unsafe {
-            // Best-effort GPU quiescence before dismantling objects borrowed by
-            // both APIs. Drop must not panic.
+            // Shutdown-only quiescence. Steady-state presentation never waits;
+            // queue idle here merely guarantees any submitted GL->Vulkan chain
+            // has completed before the cross-API objects are destroyed.
             let _ = self.vk_device.queue_wait_idle(self.vk_queue);
-            self.gl.finish();
+        }
+        let _ = self.retire_inflight();
+        unsafe {
             if self.vdpau_device.is_some() {
                 (self.ext.vdpau_fini)();
             }
@@ -743,6 +804,7 @@ impl Drop for VdpauVulkanBridge {
 
             self.vk_device.destroy_fence(self.copy_fence, None);
             self.vk_device.destroy_semaphore(self.gl_done, None);
+            self.vk_device.destroy_semaphore(self.vk_ready, None);
             self.vk_device.destroy_command_pool(self.command_pool, None);
             self.vk_device.destroy_image(self.source_image, None);
             self.vk_device.free_memory(self.source_memory, None);
@@ -786,6 +848,7 @@ impl ExtFns {
             import_memory_fd: load!("glImportMemoryFdEXT", GlImportMemoryFdExt),
             texture_storage_mem_2d: load!("glTextureStorageMem2DEXT", GlTextureStorageMem2dExt),
             signal_vk_semaphore: load!("glSignalVkSemaphoreNV", GlSignalVkSemaphoreNv),
+            wait_vk_semaphore: load!("glWaitVkSemaphoreNV", GlWaitVkSemaphoreNv),
         })
     }
 }

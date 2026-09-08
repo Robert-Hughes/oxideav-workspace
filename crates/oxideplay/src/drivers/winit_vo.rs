@@ -306,13 +306,11 @@ impl VideoEngine for WinitVideoEngine {
 
         #[cfg(target_os = "freebsd")]
         if let Some(hw) = frame.as_hardware_video() {
-            if let Some(vdpau) = hw.downcast_ref::<oxideav_vdpau::VdpauVideoFrameStorage>() {
-                let Some(video) = self.app.video.as_mut() else {
-                    return Ok(());
-                };
-                if video.render_vdpau(vdpau)? {
-                    return Ok(());
-                }
+            let Some(video) = self.app.video.as_mut() else {
+                return Ok(());
+            };
+            if video.render_vdpau(hw)? {
+                return Ok(());
             }
         }
 
