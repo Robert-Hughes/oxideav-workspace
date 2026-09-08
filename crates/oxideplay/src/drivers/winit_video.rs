@@ -8,10 +8,18 @@
 use std::sync::Arc;
 
 use crate::drivers::video_convert::to_yuv420p;
+
+#[cfg(target_os = "freebsd")]
+use crate::drivers::vdpau_vulkan_bridge::VdpauVulkanBridge;
 #[cfg(feature = "egui")]
 use crate::drivers::winit_overlay::OverlayUi;
 use oxideav_core::arena::sync::Frame as ArenaFrame;
 use oxideav_core::{CodecParameters, Error, PixelFormat, Result, VideoFrame};
+#[cfg(target_os = "freebsd")]
+use oxideav_vdpau::VdpauVideoFrameStorage;
+
+#[cfg(target_os = "freebsd")]
+use oxideav_core::HardwareVideoFrameStorage;
 
 pub struct VideoRenderer {
     device: wgpu::Device,
@@ -20,6 +28,17 @@ pub struct VideoRenderer {
     surface_cfg: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+
+    #[cfg(target_os = "freebsd")]
+    rgba_pipeline: wgpu::RenderPipeline,
+    #[cfg(target_os = "freebsd")]
+    rgba_bind_group_layout: wgpu::BindGroupLayout,
+    #[cfg(target_os = "freebsd")]
+    vdpau_bridge: Option<VdpauVulkanBridge>,
+    #[cfg(target_os = "freebsd")]
+    vdpau_bind_group: Option<wgpu::BindGroup>,
+    #[cfg(target_os = "freebsd")]
+    vdpau_bridge_disabled: bool,
     sampler: wgpu::Sampler,
     /// The window we render into. Kept so the overlay can ask for
     /// scale factor + winit input each frame.
@@ -261,6 +280,85 @@ impl VideoRenderer {
             cache: None,
         });
 
+        #[cfg(target_os = "freebsd")]
+        let rgba_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rgba_to_screen"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("rgba_to_screen.wgsl").into()),
+        });
+        #[cfg(target_os = "freebsd")]
+        let rgba_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("rgba-bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        #[cfg(target_os = "freebsd")]
+        let rgba_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("rgba-pl"),
+            bind_group_layouts: &[Some(&rgba_bind_group_layout)],
+            immediate_size: 0,
+        });
+        #[cfg(target_os = "freebsd")]
+        let rgba_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("rgba-pipeline"),
+            layout: Some(&rgba_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &rgba_shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &rgba_shader,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("yuv-sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -305,6 +403,17 @@ impl VideoRenderer {
             surface_cfg,
             pipeline,
             bind_group_layout,
+
+            #[cfg(target_os = "freebsd")]
+            rgba_pipeline,
+            #[cfg(target_os = "freebsd")]
+            rgba_bind_group_layout,
+            #[cfg(target_os = "freebsd")]
+            vdpau_bridge: None,
+            #[cfg(target_os = "freebsd")]
+            vdpau_bind_group: None,
+            #[cfg(target_os = "freebsd")]
+            vdpau_bridge_disabled: false,
             sampler,
             window,
             #[cfg(feature = "egui")]
@@ -422,6 +531,93 @@ impl VideoRenderer {
             view.v,
         );
         self.draw_uploaded_frame(view.width, view.height)?;
+        Ok(true)
+    }
+
+    #[cfg(target_os = "freebsd")]
+    pub fn render_vdpau(&mut self, frame: &VdpauVideoFrameStorage) -> Result<bool> {
+        if self.vdpau_bridge_disabled {
+            return Ok(false);
+        }
+        let width = frame.width();
+        let height = frame.height();
+        if width == 0
+            || height == 0
+            || width > self.max_texture_dim
+            || height > self.max_texture_dim
+        {
+            return Ok(false);
+        }
+
+        let rebuild = self
+            .vdpau_bridge
+            .as_ref()
+            .map_or(true, |bridge| bridge.dimensions() != (width, height));
+        if rebuild {
+            match VdpauVulkanBridge::new(&self.device, &self.queue, width, height) {
+                Ok(bridge) => {
+                    let view = bridge
+                        .output_texture()
+                        .create_view(&wgpu::TextureViewDescriptor::default());
+                    let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("vdpau-rgba-bg"),
+                        layout: &self.rgba_bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&self.sampler),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: self.uniform_buffer.as_entire_binding(),
+                            },
+                        ],
+                    });
+                    drop(view);
+                    self.vdpau_bridge = Some(bridge);
+                    self.vdpau_bind_group = Some(bind_group);
+                    eprintln!(
+                        "oxideplay: VDPAU GPU bridge active (GLX interop2 -> Vulkan, {}x{})",
+                        width, height
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "oxideplay: VDPAU GPU bridge unavailable ({e}); falling back to CPU materialisation"
+                    );
+                    self.vdpau_bridge_disabled = true;
+                    return Ok(false);
+                }
+            }
+        }
+
+        let copy_result = self
+            .vdpau_bridge
+            .as_mut()
+            .expect("bridge was created above")
+            .copy_from_vdpau(frame);
+        if let Err(e) = copy_result {
+            eprintln!(
+                "oxideplay: VDPAU GPU bridge failed ({e}); falling back to CPU materialisation"
+            );
+            self.vdpau_bridge = None;
+            self.vdpau_bind_group = None;
+            self.vdpau_bridge_disabled = true;
+            return Ok(false);
+        }
+
+        self.src_format = PixelFormat::Yuv420P;
+        self.src_width = width;
+        self.src_height = height;
+        if self.draw_vdpau_frame(width, height)? {
+            if let Some(bridge) = self.vdpau_bridge.as_mut() {
+                bridge.mark_sampled();
+            }
+        }
         Ok(true)
     }
 
@@ -570,6 +766,97 @@ impl VideoRenderer {
         self.queue.submit(Some(encoder.finish()));
         frame_tex.present();
         Ok(())
+    }
+
+    #[cfg(target_os = "freebsd")]
+    fn draw_vdpau_frame(&mut self, src_w: u32, src_h: u32) -> Result<bool> {
+        let surface_aspect = self.surface_cfg.width as f32 / self.surface_cfg.height.max(1) as f32;
+        let content_aspect = src_w as f32 / src_h.max(1) as f32;
+        let (sx, sy, ox, oy) = if content_aspect > surface_aspect {
+            let h_frac = surface_aspect / content_aspect;
+            let off_y = (1.0 - h_frac) * 0.5;
+            (1.0, 1.0 / h_frac, 0.0, off_y)
+        } else {
+            let w_frac = content_aspect / surface_aspect;
+            let off_x = (1.0 - w_frac) * 0.5;
+            (1.0 / w_frac, 1.0, off_x, 0.0)
+        };
+        self.queue.write_buffer(
+            &self.uniform_buffer,
+            0,
+            bytemuck::cast_slice(&[sx, sy, ox, oy]),
+        );
+
+        let frame_tex = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface.configure(&self.device, &self.surface_cfg);
+                match self.surface.get_current_texture() {
+                    wgpu::CurrentSurfaceTexture::Success(t)
+                    | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+                    other => {
+                        return Err(Error::other(format!(
+                            "wgpu: reacquire surface texture: {other:?}"
+                        )));
+                    }
+                }
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(false);
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(Error::other("wgpu: surface texture validation error"));
+            }
+        };
+        let view = frame_tex
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("vdpau-rgba-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("vdpau-rgba-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.rgba_pipeline);
+            if let Some(bg) = self.vdpau_bind_group.as_ref() {
+                pass.set_bind_group(0, bg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+        }
+
+        #[cfg(feature = "egui")]
+        if let Some(o) = self.overlay.as_mut() {
+            let screen_size = (self.surface_cfg.width, self.surface_cfg.height);
+            o.paint(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &self.window,
+                &view,
+                screen_size,
+            );
+        }
+
+        self.queue.submit(Some(encoder.finish()));
+        frame_tex.present();
+        Ok(true)
     }
 
     /// Render the overlay even if no new YUV frame arrived. Called

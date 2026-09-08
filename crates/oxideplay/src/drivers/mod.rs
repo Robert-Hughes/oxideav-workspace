@@ -23,6 +23,9 @@ pub mod sdl2_video;
 
 #[cfg(feature = "winit")]
 pub mod winit_video;
+
+#[cfg(all(feature = "winit", target_os = "freebsd"))]
+pub mod vdpau_vulkan_bridge;
 #[cfg(feature = "winit")]
 pub mod winit_vo;
 

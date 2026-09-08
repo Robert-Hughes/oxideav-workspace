@@ -30,7 +30,17 @@ sdl2 = []
 # `sysaudio` (or `sdl2`) independently. Enables `--vo winit`. Pulls in
 # the `egui` overlay UI by default — egui-wgpu integrates naturally
 # with the wgpu YUV→RGB pass and is pure Rust like the rest.
-winit = ["dep:winit", "dep:wgpu", "dep:bytemuck", "dep:pollster", "egui"]
+winit = [
+    "dep:winit",
+    "dep:wgpu",
+    "dep:bytemuck",
+    "dep:pollster",
+    "egui",
+    "dep:ash",
+    "dep:glow",
+    "dep:x11-dl",
+    "dep:oxideav-vdpau",
+]
 # Mouse-driven on-screen overlay (play/pause, seek bar, volume) drawn
 # on top of the wgpu video surface. Only meaningful when `winit` is
 # also on; gated separately so a downstream consumer can disable the
@@ -81,3 +91,13 @@ ringbuf = { version = "0.4", optional = true }
 egui = { version = "0.34", optional = true, default-features = false, features = ["default_fonts"] }
 egui-wgpu = { version = "0.34", optional = true, default-features = false, features = ["winit"] }
 egui-winit = { version = "0.34", optional = true, default-features = false, features = ["links"] }
+
+# FreeBSD/NVIDIA hardware-video bridge. These are implementation details of
+# the winit renderer and are only compiled on FreeBSD. Native GL/X11 libraries
+# remain runtime-loaded through x11-dl/glow; ash uses wgpu's existing Vulkan
+# device rather than creating a second presentation stack.
+[target.'cfg(target_os = "freebsd")'.dependencies]
+ash = { version = "0.38", optional = true }
+glow = { version = "0.17", optional = true }
+x11-dl = { version = "2.21", optional = true }
+oxideav-vdpau = { workspace = true, optional = true }
