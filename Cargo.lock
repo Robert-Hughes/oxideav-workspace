@@ -2973,6 +2973,7 @@ dependencies = [
  "m3u8-rs",
  "oxideav-core",
  "oxideav-http",
+ "oxideav-mpegts",
  "url",
 ]
 
