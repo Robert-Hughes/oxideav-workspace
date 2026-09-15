@@ -2939,6 +2939,7 @@ name = "oxideav-h264"
 version = "0.1.8"
 dependencies = [
  "criterion 0.8.2",
+ "log",
  "oxideav-core",
  "thiserror 2.0.18",
 ]
@@ -2970,6 +2971,7 @@ dependencies = [
 name = "oxideav-hls"
 version = "0.1.0"
 dependencies = [
+ "log",
  "m3u8-rs",
  "oxideav-core",
  "oxideav-http",
@@ -3459,6 +3461,7 @@ version = "0.1.12"
 dependencies = [
  "criterion 0.5.1",
  "indexmap",
+ "log",
  "oxideav-audio-filter",
  "oxideav-core",
  "oxideav-pixfmt",
@@ -3768,6 +3771,7 @@ version = "0.0.2"
 dependencies = [
  "libloading 0.8.9",
  "linkme",
+ "log",
  "oxideav-bitstream",
  "oxideav-core",
  "oxideav-h264",
