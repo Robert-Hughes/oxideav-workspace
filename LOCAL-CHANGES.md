@@ -69,6 +69,28 @@ implementations that reject the ioctl retain the previous one-period estimate as
 a compatibility fallback. The FreeBSD hardware smoke test exercises the real
 ioctl path with silence.
 
+## Android AAudio output
+
+Component commit:
+
+```text
+c7c390c feat(sysaudio): add Android AAudio output
+```
+
+`oxideav-sysaudio` now has a native Android AAudio backend, loaded from
+`libaaudio.so` at runtime. It is available from API 26 without introducing a
+link-time Android audio dependency, uses the native real-time PCM-float data
+callback, requests low-latency output, supports numeric `AudioDeviceInfo` ids
+for explicit routing with post-open device-id verification, reports negotiated
+format, and derives live queue latency from AAudio's written/read frame counters.
+
+`oxideav-sysaudio/examples/smoke.rs` is the hardware-focused iteration tool for
+this backend. The same executable runs across sysaudio platforms, stays silent
+unless `--tone` is requested, and covers probe/open, callback progress,
+software volume, pause/resume, latency and teardown. It can be cross-linked as a
+standalone Android ARM64 PIE and pushed directly over ADB, avoiding a full APK
+build while iterating on AAudio.
+
 ## HLS VOD source
 
 Components:
